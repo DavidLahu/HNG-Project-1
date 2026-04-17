@@ -3,7 +3,7 @@
 A REST API that enriches a name with gender, age, and nationality predictions.
 
 ## Base URL
-https://your-railway-url.up.railway.app
+https://hng-project-1-production.up.railway.app/
 
 ## Endpoints
 
