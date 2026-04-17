@@ -1,30 +1,26 @@
-from fastapi import Request
+from fastapi import Request, FastAPI, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pathlib import Path
+from pydantic import BaseModel
+from datetime import timezone, datetime
+from uuid6 import uuid7
 import os
 import httpx
 import asyncio
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import asyncpg
 
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy import text
-
-from datetime import timezone, datetime
-from uuid6 import uuid7
-
-load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-engine = create_async_engine(DATABASE_URL, echo=True)
-AsyncSessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+DATABASE_URL = os.getenv("DATABASE_URL").replace("postgresql+asyncpg://", "postgresql://")
 
 async def get_db():
-    async with AsyncSessionLocal() as session:
-        yield session
+    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
+    try:
+        yield conn
+    finally:
+        await conn.close()
 
 app = FastAPI()
 
@@ -124,13 +120,14 @@ async def enrich_text(name: str):
 class UserInput(BaseModel):
     name: str
 
+
 @app.get("/")
 async def root():
     return {"message": "Everything working fine."}
 
 
 @app.post("/api/profiles", status_code=201)
-async def profile(input: UserInput, db: AsyncSession = Depends(get_db)):
+async def profile(input: UserInput, db=Depends(get_db)):
     cleaned_username = input.name.strip()
     if not cleaned_username:
         raise HTTPException(status_code=400, detail={
@@ -138,20 +135,13 @@ async def profile(input: UserInput, db: AsyncSession = Depends(get_db)):
             "message": "Missing or empty name"
         })
 
-    if not isinstance(cleaned_username, str):
-        raise HTTPException(status_code=422, detail={
-            "status": "error",
-            "message": "Unprocessable Entity: Invalid Type"
-        })
-
-    result = await db.execute(
-        text("SELECT * FROM profiles WHERE LOWER(name) = LOWER(:name)"),
-        {"name": cleaned_username}
+    existing = await db.fetchrow(
+        "SELECT * FROM profiles WHERE LOWER(name) = LOWER($1)",
+        cleaned_username
     )
 
-    existing = result.fetchone()
     if existing:
-        row = dict(existing._mapping)
+        row = dict(existing)
         row["created_at"] = row["created_at"].isoformat()
         return {"status": "success", "message": "Profile already exists", "data": row}
 
@@ -159,15 +149,16 @@ async def profile(input: UserInput, db: AsyncSession = Depends(get_db)):
     created_at = datetime.now(timezone.utc)
 
     await db.execute(
-        text("""
-            INSERT INTO profiles (id, name, gender, gender_probability, sample_size,
-                                  age, age_group, country_id, country_probability, created_at)
-            VALUES (:id, :name, :gender, :gender_probability, :sample_size,
-                    :age, :age_group, :country_id, :country_probability, :created_at)
-        """),
-        {**enriched, "created_at": created_at}
+        """
+        INSERT INTO profiles (id, name, gender, gender_probability, sample_size,
+                              age, age_group, country_id, country_probability, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        """,
+        enriched["id"], enriched["name"], enriched["gender"],
+        enriched["gender_probability"], enriched["sample_size"],
+        enriched["age"], enriched["age_group"], enriched["country_id"],
+        enriched["country_probability"], created_at
     )
-    await db.commit()
 
     return {
         "status": "success",
@@ -180,68 +171,71 @@ async def profile(input: UserInput, db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/api/profiles/{id}", status_code=200)
-async def get_user(id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        text("SELECT * FROM profiles WHERE id = :id"), {"id": id}
+async def get_user(id: str, db=Depends(get_db)):
+    row = await db.fetchrow(
+        "SELECT * FROM profiles WHERE id = $1", id
     )
 
-    row = result.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail={
             "status": "error",
             "message": "Not Found: Profile not found"
         })
-    data = dict(row._mapping)
+
+    data = dict(row)
     data["created_at"] = data["created_at"].isoformat()
     return {"status": "success", "data": data}
 
 
 @app.get("/api/profiles", status_code=200)
-async def get_all_profiles(name: str | None = None, gender: str | None = None, country_id: str | None = None, age_group: str | None = None, db: AsyncSession = Depends(get_db)):
+async def get_all_profiles(
+    name: str | None = None,
+    gender: str | None = None,
+    country_id: str | None = None,
+    age_group: str | None = None,
+    db=Depends(get_db)
+):
     conditions = []
-    params = {}
+    params = []
 
     if name:
-        conditions.append("LOWER(name) LIKE LOWER(:name)")
-        params["name"] = f"%{name}%"
+        params.append(f"%{name}%")
+        conditions.append(f"LOWER(name) LIKE LOWER(${len(params)})")
     if gender:
-        conditions.append("LOWER(gender) = LOWER(:gender)")
-        params["gender"] = gender
+        params.append(gender)
+        conditions.append(f"LOWER(gender) = LOWER(${len(params)})")
     if age_group:
-        conditions.append("LOWER(age_group) = LOWER(:age_group)")
-        params["age_group"] = age_group
+        params.append(age_group)
+        conditions.append(f"LOWER(age_group) = LOWER(${len(params)})")
     if country_id:
-        conditions.append("LOWER(country_id) = LOWER(:country_id)")
-        params["country_id"] = country_id
+        params.append(country_id)
+        conditions.append(f"LOWER(country_id) = LOWER(${len(params)})")
 
     where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     query = f"SELECT id, name, gender, age, age_group, country_id FROM profiles {where_clause}"
 
-    result = await db.execute(text(query), params)
-    rows = result.fetchall()
+    rows = await db.fetch(query, *params)
 
     return {
         "status": "success",
         "count": len(rows),
-        "data": [dict(r._mapping) for r in rows]
+        "data": [dict(r) for r in rows]
     }
 
 
 @app.delete("/api/profiles/{id}", status_code=204)
-async def deletion(id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        text("SELECT * FROM profiles WHERE id = :id"),
-        {"id": id}
+async def deletion(id: str, db=Depends(get_db)):
+    row = await db.fetchrow(
+        "SELECT id FROM profiles WHERE id = $1", id
     )
 
-    if not result.fetchone():
+    if not row:
         raise HTTPException(status_code=404, detail={
             "status": "error",
             "message": "Profile not found"
         })
+
     await db.execute(
-        text("DELETE FROM profiles WHERE id = :id"),
-        {"id": id}
+        "DELETE FROM profiles WHERE id = $1", id
     )
-    await db.commit()
     return None
