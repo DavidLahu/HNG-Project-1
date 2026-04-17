@@ -1,3 +1,6 @@
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
 from pathlib import Path
 import os
@@ -24,6 +27,34 @@ async def get_db():
         yield session
 
 app = FastAPI()
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={"status": "error", "message": "Unprocessable Entity: Invalid input"}
+    )
+
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc):
+    return JSONResponse(
+        status_code=404,
+        content={"status": "error", "message": "Not Found"}
+    )
+
+@app.exception_handler(405)
+async def method_not_allowed_handler(request: Request, exc):
+    return JSONResponse(
+        status_code=405,
+        content={"status": "error", "message": "Method Not Allowed"}
+    )
+
+@app.exception_handler(500)
+async def internal_error_handler(request: Request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"status": "error", "message": "Internal server error"}
+    )
 
 app.add_middleware(
     CORSMiddleware,
